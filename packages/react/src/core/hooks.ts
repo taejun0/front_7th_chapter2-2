@@ -3,12 +3,35 @@ import { context } from "./context";
 import { EffectHook } from "./types";
 import { enqueueRender } from "./render";
 import { HookTypes } from "./constants";
+import { enqueue } from "../utils/enqueue";
 
 /**
  * 사용되지 않는 컴포넌트의 훅 상태와 이펙트 클린업 함수를 정리합니다.
  */
 export const cleanupUnusedHooks = () => {
-  // 여기를 구현하세요.
+  const { hooks } = context;
+  const visited = hooks.visited;
+
+  // 방문하지 않은 컴포넌트의 훅 정리
+  for (const [path, hooksArray] of hooks.state.entries()) {
+    if (!visited.has(path)) {
+      // 이펙트 클린업 실행
+      for (const hook of hooksArray) {
+        if (hook && typeof hook === "object" && "kind" in hook && hook.kind === HookTypes.EFFECT) {
+          const effectHook = hook as EffectHook;
+          if (effectHook.cleanup) {
+            effectHook.cleanup();
+          }
+        }
+      }
+
+      hooks.state.delete(path);
+      hooks.cursor.delete(path);
+    }
+  }
+
+  // visited 초기화
+  hooks.visited.clear();
 };
 
 /**
@@ -17,15 +40,44 @@ export const cleanupUnusedHooks = () => {
  * @returns [현재 상태, 상태를 업데이트하는 함수]
  */
 export const useState = <T>(initialValue: T | (() => T)): [T, (nextValue: T | ((prev: T) => T)) => void] => {
-  // 여기를 구현하세요.
-  // 1. 현재 컴포넌트의 훅 커서와 상태 배열을 가져옵니다.
-  // 2. 첫 렌더링이라면 초기값으로 상태를 설정합니다.
-  // 3. 상태 변경 함수(setter)를 생성합니다.
-  //    - 새 값이 이전 값과 같으면(Object.is) 재렌더링을 건너뜁니다.
-  //    - 값이 다르면 상태를 업데이트하고 재렌더링을 예약(enqueueRender)합니다.
-  // 4. 훅 커서를 증가시키고 [상태, setter]를 반환합니다.
-  const setState = (nextValue: T | ((prev: T) => T)) => {};
-  return [initialValue as T, setState];
+  const path = context.hooks.currentPath;
+  const cursor = context.hooks.currentCursor;
+  const hooks = context.hooks.currentHooks;
+
+  // 첫 렌더링이면 초기값 설정
+  if (cursor >= hooks.length) {
+    const value = typeof initialValue === "function" ? (initialValue as () => T)() : initialValue;
+    hooks.push(value);
+    context.hooks.state.set(path, hooks);
+  }
+
+  const currentValue = hooks[cursor] as T;
+
+  // 상태 변경 함수
+  const setState = (nextValue: T | ((prev: T) => T)) => {
+    const hooks = context.hooks.state.get(path) || [];
+    const currentValue = hooks[cursor] as T;
+
+    // 새 값 계산
+    const newValue = typeof nextValue === "function" ? (nextValue as (prev: T) => T)(currentValue) : nextValue;
+
+    // 값이 같으면 재렌더링 건너뛰기
+    if (Object.is(currentValue, newValue)) {
+      return;
+    }
+
+    // 상태 업데이트
+    hooks[cursor] = newValue;
+    context.hooks.state.set(path, hooks);
+
+    // 재렌더링 예약
+    enqueueRender();
+  };
+
+  // 커서 증가
+  context.hooks.cursor.set(path, cursor + 1);
+
+  return [currentValue, setState];
 };
 
 /**
@@ -34,9 +86,43 @@ export const useState = <T>(initialValue: T | (() => T)): [T, (nextValue: T | ((
  * @param deps - 의존성 배열. 이 값들이 변경될 때만 이펙트가 다시 실행됩니다.
  */
 export const useEffect = (effect: () => (() => void) | void, deps?: unknown[]): void => {
-  // 여기를 구현하세요.
-  // 1. 이전 훅의 의존성 배열과 현재 의존성 배열을 비교(shallowEquals)합니다.
-  // 2. 의존성이 변경되었거나 첫 렌더링일 경우, 이펙트 실행을 예약합니다.
-  // 3. 이펙트 실행 전, 이전 클린업 함수가 있다면 먼저 실행합니다.
-  // 4. 예약된 이펙트는 렌더링이 끝난 후 비동기로 실행됩니다.
+  const path = context.hooks.currentPath;
+  const cursor = context.hooks.currentCursor;
+  const hooks = context.hooks.currentHooks;
+
+  // 이전 훅 가져오기
+  let prevHook: EffectHook | undefined;
+  if (cursor < hooks.length) {
+    const hook = hooks[cursor];
+    if (hook && typeof hook === "object" && "kind" in hook && hook.kind === HookTypes.EFFECT) {
+      prevHook = hook as EffectHook;
+    }
+  }
+
+  // 의존성 비교
+  const shouldRun = !prevHook || !deps || !shallowEquals(prevHook.deps, deps);
+
+  // 이펙트 훅 생성/업데이트
+  const effectHook: EffectHook = {
+    kind: HookTypes.EFFECT,
+    deps: deps ?? null,
+    cleanup: prevHook?.cleanup ?? null,
+    effect,
+  };
+
+  // 훅 저장
+  if (cursor >= hooks.length) {
+    hooks.push(effectHook);
+  } else {
+    hooks[cursor] = effectHook;
+  }
+  context.hooks.state.set(path, hooks);
+
+  // 이펙트 실행 예약
+  if (shouldRun) {
+    context.effects.queue.push({ path, cursor });
+  }
+
+  // 커서 증가
+  context.hooks.cursor.set(path, cursor + 1);
 };
